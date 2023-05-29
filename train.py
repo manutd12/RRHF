@@ -24,6 +24,14 @@ import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
 import json
+from peft import (
+    get_peft_model,
+    LoraConfig,
+    TaskType,
+    PeftModel,
+    prepare_model_for_int8_training,
+    set_peft_model_state_dict,
+)
 
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
@@ -79,6 +87,12 @@ class TrainingArguments(transformers.TrainingArguments):
     length_penalty: float = field(default=1.0)
     only_use_provide: bool = field(default=False)
     only_use_sample: bool = field(default=False)
+    lora_r: int = field(default=8)
+    lora_alpha: int = field(default=16)
+    lora_dropout: float = field(default=0.05)
+    lora_target_modules = ["query_key_value"]
+    lora_bias = "none"
+
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -181,12 +195,12 @@ class DataCollatorForSupervisedDataset(object):
 
     def __call__(self, instances):
 
-        idxs = []
-        all_scores = []
-        input_ids = []
+        idxs = []  # 每个元素是一条query的id
+        all_scores = [] # 每个元素是一条query的score
+        input_ids = [] # 每个元素是一条response的score
         score_mask = []
-        labels = []
-        for idx, ins in enumerate(instances):
+        labels = [] # 每个元素是一条query的label(即response)
+        for idx, ins in enumerate(instances): #  遍历每条数据 【包括一条query，多个response以及每个response的score】
 
             ins = ins['input_ids'] # hack
             query = ins['query']
@@ -195,16 +209,16 @@ class DataCollatorForSupervisedDataset(object):
             all_scores.append(scores)
             idxs.append([idx] * len(scores))
 
-            query_input_ids = _single_tokenize(query, self.tokenizer)
-            query_target = torch.LongTensor([IGNORE_INDEX] * (query_input_ids.shape[0] - 1))
-            dummy_target = torch.LongTensor([IGNORE_INDEX])
+            query_input_ids = _single_tokenize(query, self.tokenizer) # query_input_ids: [query_length,1]
+            query_target = torch.LongTensor([IGNORE_INDEX] * (query_input_ids.shape[0] - 1))  # query部分每个字对应的label的id是-100。query最后一个字的label是response的第一个字
+            dummy_target = torch.LongTensor([IGNORE_INDEX]) # response输入的最后一个字的label id是-100)
             for res in responses:
                 if self.stop_response:
                     r = stop_response(res)
                 else:
                     r = res
-                res_input_ids = _single_tokenize(r + self.tokenizer.eos_token, self.tokenizer, max_len=self.tokenizer.model_max_length-query_input_ids.shape[0]) # eos here
-                input_ids.append(torch.cat((query_input_ids, res_input_ids), dim=0))
+                res_input_ids = _single_tokenize(r + self.tokenizer.eos_token, self.tokenizer, max_len=self.tokenizer.model_max_length-query_input_ids.shape[0]) # response输入加上eos , [response_length,1]
+                input_ids.append(torch.cat((query_input_ids, res_input_ids), dim=0))  # query_input_ids 拼接 res_input_ids， 【query_length+response_length, 1】
                 labels.append(torch.cat((query_target, res_input_ids, dummy_target), dim=0))
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -231,6 +245,11 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
 
 class RRHFTrainer(Trainer):
     def gather_logits_labels(self, logits, labels):
+        '''
+        logoits: [batch_size, seq_length, vocab_nums] 每个位置，针对词表中每个字的预测概率
+        labels: 【batch_size, seq_length】 每个位置的label
+        return : 【batch_size, seq_length】每个位置，预测为label的概率
+        '''
 
         mask = (labels != -100).float()
         new_logits = logits.clone()  # Create a copy to avoid in-place modification
@@ -240,22 +259,39 @@ class RRHFTrainer(Trainer):
         return output
 
     def get_score(self, logit_label, labels):
+        '''
+        logit_label：【batch_size, seq_length】每个位置，预测为label的概率
+        labels: 【batch_size, seq_length, 1】 每个位置的label
+        return: 【batch_size, 1】 每句response的概率得分，计算方式：这句话每个字的log_prob的和 / 这句话的长度
+        '''
         mask = (labels != -100).float()
         length = mask.sum(-1)
         scores = logit_label.sum(-1) / (length ** self.args.length_penalty)
         return scores
 
     def rrhf_loss(self, scores, idxs, rw_scores):
+        '''
+        scores：生成的每句话的预测概率得分: [batch,1] 计算方式：这句话每个字的log_prob的和 / 这句话的长度
+        rw_scores：生成的每句话，reward_model的打分 [batch,1]
+        '''
         diff = scores.unsqueeze(0) - scores.unsqueeze(-1) # b * b
         rw_diff = rw_scores.unsqueeze(0) - rw_scores.unsqueeze(-1) # b * b
         aval = torch.bitwise_and(rw_diff > 0, diff < 0)[0]
+        torch.nn.MarginRankingLoss()
         return -diff[aval].sum()
 
     def sft_loss(self, logit_label, idxs, rw_scores):
-        max_idx = torch.argmax(rw_scores)
+        '''
+        logit_label：【batch_size, seq_length】每个位置，预测为label的概率
+        rw_scores：生成的每句话,reward_model的打分 [batch,1]
+        '''
+        max_idx = torch.argmax(rw_scores)  # 如果dim=None，则把rw_scores排列成一个一维向量，然后找出这个一维向量里面最大值的索引。也就是找到第几个句子的score最高
         return -logit_label[max_idx].mean()
 
     def compute_loss(self, model, inputs, return_outputs=False):
+        '''
+        inputs: 一个batch的样本， dict形式
+        '''
         if self.args.only_use_provide:
             inputs['input_ids'] = inputs['input_ids'][-2:]
             inputs['attention_mask'] = inputs['attention_mask'][-2:]
@@ -280,11 +316,11 @@ class RRHFTrainer(Trainer):
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
+
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -309,6 +345,21 @@ def train():
         )
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+
+    if training_args.peft_type == 'LORA':
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=training_args.lora_r,
+            lora_alpha=training_args.lora_alpha,
+            lora_dropout=training_args.lora_dropout,
+            target_modules=training_args.lora_target_modules,
+            bias=training_args.lora_bias,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+
+
     trainer = RRHFTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
