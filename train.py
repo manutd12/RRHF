@@ -32,6 +32,10 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
+from transformers import LlamaForCausalLM, LlamaTokenizer
+
+import os
+
 
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
@@ -62,6 +66,9 @@ PROMPT_DICT = {
         "### Instruction:\n{instruction}\n\n### Response:"
     ),
 }
+max_response = 2
+
+
 
 
 @dataclass
@@ -90,8 +97,11 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_r: int = field(default=8)
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.05)
-    lora_target_modules = ["query_key_value"]
+    lora_target_modules =  ["q_proj", "k_proj", "v_proj", "o_proj"]  # LLAMA:["q_proj", "k_proj", "v_proj", "o_proj"]   other: ["query_key_value"]
     lora_bias = "none"
+    peft_type: str = field(default="LORA")
+
+
 
 
 
@@ -200,19 +210,21 @@ class DataCollatorForSupervisedDataset(object):
         input_ids = [] # 每个元素是一条response的score
         score_mask = []
         labels = [] # 每个元素是一条query的label(即response)
+        print(len(instances)) 
+        # len(instances) = batch_size
         for idx, ins in enumerate(instances): #  遍历每条数据 【包括一条query，多个response以及每个response的score】
 
             ins = ins['input_ids'] # hack
             query = ins['query']
             responses = ins['responses']
-            scores = ins['scores']
+            scores = ins['scores'][:max_response]
             all_scores.append(scores)
             idxs.append([idx] * len(scores))
 
             query_input_ids = _single_tokenize(query, self.tokenizer) # query_input_ids: [query_length,1]
             query_target = torch.LongTensor([IGNORE_INDEX] * (query_input_ids.shape[0] - 1))  # query部分每个字对应的label的id是-100。query最后一个字的label是response的第一个字
             dummy_target = torch.LongTensor([IGNORE_INDEX]) # response输入的最后一个字的label id是-100)
-            for res in responses:
+            for res in responses[:max_response]: # 控制使用多少条response
                 if self.stop_response:
                     r = stop_response(res)
                 else:
@@ -239,6 +251,7 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = ScoreDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    print("len dataset:{}".format(train_dataset.__len__))
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, stop_response=data_args.stop_response)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -271,13 +284,22 @@ class RRHFTrainer(Trainer):
 
     def rrhf_loss(self, scores, idxs, rw_scores):
         '''
-        scores：生成的每句话的预测概率得分: [batch,1] 计算方式：这句话每个字的log_prob的和 / 这句话的长度
-        rw_scores：生成的每句话，reward_model的打分 [batch,1]
+        scores：生成的每句话的预测概率得分: [batch*候选response数目] 计算方式：这句话每个字的log_prob的和 / 这句话的长度
+        rw_scores：生成的每句话，reward_model的打分 [1, batch*候选response数目]
         '''
-        diff = scores.unsqueeze(0) - scores.unsqueeze(-1) # b * b
-        rw_diff = rw_scores.unsqueeze(0) - rw_scores.unsqueeze(-1) # b * b
-        aval = torch.bitwise_and(rw_diff > 0, diff < 0)[0]
-        torch.nn.MarginRankingLoss()
+        # print("rrhf loss, scores shape:{}".format(scores.shape))
+        # print("rrhf loss, rw_scores shape:{}".format(rw_scores.shape))
+        # print("rrhf loss, scores.unsqueeze(0) shape:{}".format(scores.unsqueeze(0).shape)) # [batch*候选response数目] -> [1, batch*候选response数目]
+        # print("rrhf loss, scores.unsqueeze(-1) shape:{}".format(scores.unsqueeze(-1).shape)) # [batch*候选response数目] -> [batch*候选response数目,1]
+        # print("rrhf loss, rw_scores.unsqueeze(0) shape:{}".format(rw_scores.unsqueeze(0).shape)) # [1, batch*候选response数目] -> [1,1,batch*候选response数目]
+        # print("rrhf loss, rw_scores.unsqueeze(-1) shape:{}".format(rw_scores.unsqueeze(-1).shape)) # [1, batch*候选response数目] -> [1,batch*候选response数目,1]
+        diff = scores.unsqueeze(0) - scores.unsqueeze(-1) # [batch*候选response数目 , batch*候选response数目]
+        rw_diff = rw_scores.unsqueeze(0) - rw_scores.unsqueeze(-1) # [1, batch*候选response数目 , batch*候选response数目]
+        # print("rrhf loss, diff shape:{}".format(diff.shape)) 
+        # print("rrhf loss, rw_diff shape:{}".format(rw_diff.shape))
+        aval = torch.bitwise_and(rw_diff > 0, diff < 0)[0] # [batch*候选response数目 , batch*候选response数目]
+        # print("rrhf loss, aval shape:{}".format(aval.shape))
+        # print("rrhf loss, aval :{}".format(aval))
         return -diff[aval].sum()
 
     def sft_loss(self, logit_label, idxs, rw_scores):
@@ -285,6 +307,7 @@ class RRHFTrainer(Trainer):
         logit_label：【batch_size, seq_length】每个位置，预测为label的概率
         rw_scores：生成的每句话,reward_model的打分 [batch,1]
         '''
+        # print("sft loss, rw_scores shape:{}".format(rw_scores.shape))
         max_idx = torch.argmax(rw_scores)  # 如果dim=None，则把rw_scores排列成一个一维向量，然后找出这个一维向量里面最大值的索引。也就是找到第几个句子的score最高
         return -logit_label[max_idx].mean()
 
@@ -304,7 +327,15 @@ class RRHFTrainer(Trainer):
             inputs['labels'] = inputs['labels'][:-2]
             inputs["idxs"] = inputs["idxs"][:,:-2]
             inputs["scores"] = inputs["scores"][:,:-2]
-        logits = model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'))[0] # (batch * cand) * L * V
+        # print("input_ids:{}".format(inputs.get('input_ids')))
+        # print("attention_mask:{}".format(inputs.get('attention_mask')))
+        # print("input_ids size:{}".format(inputs.get('input_ids').shape))
+        # print("attention_mask size:{}".format(inputs.get('attention_mask').shape))
+        model_return = model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'), return_dict=True) # 模型返回类型是：transformers.modeling_outputs.CausalLMOutputWithPast（orderdict）
+        logits = model_return["logits"] # (batch * cand) * L * V
+        # print("logits dtype:{}".format(type(logits)))
+        # print("logits shape:{}".format(logits.shape))
+        
         logits = F.log_softmax(logits, dim=-1)
         logit_label = self.gather_logits_labels(logits, inputs.get("labels"))
         scores = self.get_score(logit_label, inputs.get("labels"))
@@ -316,19 +347,58 @@ class RRHFTrainer(Trainer):
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-    )
+
+    device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+    torch_dtype = torch.float16 if training_args.fp16 else torch.float32
+    print("device_map:{}".format(device_map))
+    print("torch_dtype:{}".format(torch_dtype))
+
+    
+    if "llama" in model_args.model_name_or_path.lower() or "alpaca" in model_args.model_name_or_path.lower():
+        model = LlamaForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            torch_dtype=torch_dtype,
+            device_map=device_map
+        )
 
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=False,
-    )
+        tokenizer = LlamaTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=False,
+        )
+    elif "chatglm" in model_args.model_name_or_path.lower():
+        config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+
+        model = transformers.AutoModel.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            trust_remote_code=True,
+            config=config
+        )
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            trust_remote_code=True
+        )
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+        )
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=False,
+        )
     if tokenizer.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
@@ -359,11 +429,12 @@ def train():
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-
+    print(training_args)
     trainer = RRHFTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    # trainer.save_state()
+    # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    model.save_pretrained(training_args.output_dir)  # 只保存lora的模型参数。 因为peftModel重写了原始model的save_pretrained函数，只把lora层的权重进行存储，因此model.save_pretrained只会存储lora权重。而trainer的save_model函数没有做相应的重写
 
 
 if __name__ == "__main__":
