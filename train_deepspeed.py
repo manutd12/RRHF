@@ -68,7 +68,7 @@ PROMPT_DICT = {
         "### Instruction:\n{instruction}\n\n### Response:"
     ),
 }
-max_response = 6
+max_response = 4
 
 
 
@@ -242,7 +242,7 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
-        print("input_ids max length:{}".format(max([item.shape[0] for item in input_ids])))
+        #print("input_ids max length:{}".format(max([item.shape[0] for item in input_ids])))
         return dict(
             input_ids=input_ids,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
@@ -255,7 +255,7 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = ScoreDataset(tokenizer=tokenizer, data_path=data_args.data_path)
-    print("len dataset:{}".format(train_dataset.__len__))
+    #print("len dataset:{}".format(train_dataset.__len__))
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, stop_response=data_args.stop_response)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -291,6 +291,8 @@ class RRHFTrainer(Trainer):
         scores：生成的每句话的预测概率得分: [batch*候选response数目] 计算方式：这句话每个字的log_prob的和 / 这句话的长度
         rw_scores：生成的每句话，reward_model的打分 [1, batch*候选response数目]
         '''
+        '''
+        # batch_size =1
         # print("rrhf loss, scores shape:{}".format(scores.shape))
         # print("rrhf loss, rw_scores shape:{}".format(rw_scores.shape))
         # print("rrhf loss, scores.unsqueeze(0) shape:{}".format(scores.unsqueeze(0).shape)) # [batch*候选response数目] -> [1, batch*候选response数目]
@@ -304,6 +306,14 @@ class RRHFTrainer(Trainer):
         aval = torch.bitwise_and(rw_diff > 0, diff < 0)[0] # [batch*候选response数目 , batch*候选response数目]
         # print("rrhf loss, aval shape:{}".format(aval.shape))
         # print("rrhf loss, aval :{}".format(aval))
+        '''
+
+        cand = rw_scores.shape[1]
+        new_scores = scores.reshape(-1, cand)   # batch * cand
+        diff = new_scores.unsqueeze(1) - new_scores.unsqueeze(-1) # batch * cand * cand
+        rw_diff = rw_scores.unsqueeze(1) - rw_scores.unsqueeze(-1)
+        aval = torch.bitwise_and(rw_diff > 0, diff < 0)
+
         return -diff[aval].sum()
 
     def sft_loss(self, logit_label, idxs, rw_scores):
@@ -311,9 +321,21 @@ class RRHFTrainer(Trainer):
         logit_label：【batch_size, seq_length】每个位置，预测为label的概率
         rw_scores：生成的每句话,reward_model的打分 [batch,1]
         '''
+        '''
+        
         # print("sft loss, rw_scores shape:{}".format(rw_scores.shape))
         max_idx = torch.argmax(rw_scores)  # 如果dim=None，则把rw_scores排列成一个一维向量，然后找出这个一维向量里面最大值的索引。也就是找到第几个句子的score最高
         return -logit_label[max_idx].mean()
+        '''
+        max_idx = torch.argmax(rw_scores, dim=1)  # batch
+        # 每个task的response个数均相同
+        cand = rw_scores.shape[1]
+        #print("logit_label:", logit_label.shape)
+        logit_label_batch = torch.reshape(logit_label, (-1, cand, logit_label.shape[-1]))  # batch * cand * L
+        expert_response_logit_label = logit_label_batch[:1, max_idx].squeeze() # batch * L
+        return -torch.sum(expert_response_logit_label.mean())
+
+
 
     def compute_loss(self, model, inputs, return_outputs=False):
         '''
@@ -333,15 +355,15 @@ class RRHFTrainer(Trainer):
             inputs["scores"] = inputs["scores"][:,:-2]
         # print("input_ids:{}".format(inputs.get('input_ids')))
         # print("attention_mask:{}".format(inputs.get('attention_mask')))
-        print("input_ids size:{}".format(inputs.get('input_ids').shape))  # [batch*candi, seq_length]
-        print("attention_mask size:{}".format(inputs.get('attention_mask').shape)) # [batch*candi, seq_length]
+        #print("input_ids size:{}".format(inputs.get('input_ids').shape))  # [batch*candi, seq_length]
+        #print("attention_mask size:{}".format(inputs.get('attention_mask').shape)) # [batch*candi, seq_length]
         if self.args.model_type == "llama":
             model_return = model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'), return_dict=True) # 模型返回类型是：transformers.modeling_outputs.CausalLMOutputWithPast（orderdict）
         elif self.args.model_type == "chatglm":
             model_return = model(input_ids=inputs.get('input_ids'), return_dict=True)
         logits = model_return["logits"] # (batch * cand) * L * V
         # print("logits dtype:{}".format(type(logits)))
-        print("logits shape:{}".format(logits.shape))
+        #print("logits shape:{}".format(logits.shape))
         
         logits = F.log_softmax(logits, dim=-1)
         logit_label = self.gather_logits_labels(logits, inputs.get("labels"))
@@ -355,18 +377,18 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-    torch_dtype = torch.float16 if training_args.fp16 else torch.float32
-    print("device_map:{}".format(device_map))
-    print("torch_dtype:{}".format(torch_dtype))
+    # device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+    # torch_dtype = torch.float16 if training_args.fp16 else torch.float32
+    # print("device_map:{}".format(device_map))
+    # print("torch_dtype:{}".format(torch_dtype))
 
     
     if "llama" in model_args.model_name_or_path.lower() or "alpaca" in model_args.model_name_or_path.lower():
         model = LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            torch_dtype=torch_dtype,
-            device_map=device_map
+            # torch_dtype=torch_dtype,
+            # device_map=device_map
         )
 
 
