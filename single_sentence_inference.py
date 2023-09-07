@@ -107,3 +107,6 @@ def generate_with_prompt(instruct="What are the three primary colors?", input=No
 while True:
     inp = input('Please input a query:')
     print(generate_with_prompt(inp, use_prompt=True))
+
+
+
